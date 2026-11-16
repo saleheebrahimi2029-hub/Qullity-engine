@@ -443,7 +443,7 @@ class UiRunner(Runner):
                 break
             el = handles[index]
             try:
-                if not el.is_visible():
+                if not el.is_visible() or el.is_disabled():
                     continue
                 label = el.evaluate(DESCRIBE_JS)
                 if any(word in label.lower() for word in skip):
@@ -452,14 +452,20 @@ class UiRunner(Runner):
                 if href and not href.startswith(("#", "/")) and urlsplit(href).netloc and urlsplit(href).netloc != urlsplit(url).netloc:
                     continue  # never leave the application under test
                 before = c.snapshot()
-                el.click(timeout=3000, no_wait_after=False)
+                bounds = el.bounding_box() if href.startswith("#") else None
+                if bounds and bounds["y"] + bounds["height"] <= 0:
+                    # Keyboard skip links can be intentionally offscreen until focused.
+                    el.press("Enter", timeout=3000)
+                else:
+                    el.click(timeout=3000, no_wait_after=False)
                 page.wait_for_timeout(400)
                 clicked += 1
                 self._record_errors(result, c, before, url, f"clicking {label}")
                 result.tests.append(TestCase(f"ui.click::{slug(url)}::{index}", url, f"click {label}", Status.PASS if c.snapshot() == before else Status.FAIL))
             except PlaywrightError as exc:
+                call_log = str(exc).lower()
                 message = str(exc).splitlines()[0]
-                if "not attached" in message or "not visible" in message or "intercepts pointer" in message:
+                if any(reason in call_log for reason in ("not attached", "not visible", "intercepts pointer")):
                     continue  # element moved or is covered; not a defect by itself
                 result.findings.append(Finding("ui.interaction", Dimension.UI_INTERACTION, Severity.SEV3, "Control could not be clicked",
                                                detail=message[:300], location=Location(url), evidence={"key": f"{url}:noclick:{index}"}))
@@ -491,7 +497,21 @@ class UiRunner(Runner):
 
     @staticmethod
     def _axe(result: CheckResult, page: Any, url: str, viewport: str, source: str) -> None:
-        page.add_script_tag(content=source)
+        if urlsplit(url).hostname in {"127.0.0.1", "::1", "localhost"}:
+            # Serve only this test request in the browser context. The application's
+            # CSP still decides whether the same-origin script can execute.
+            asset_url = urljoin(url, "/__pqe_browser_audit__/axe.min.js")
+
+            def serve_axe(route: Any) -> None:
+                route.fulfill(status=200, content_type="application/javascript", body=source)
+
+            page.route(asset_url, serve_axe, times=1)
+            try:
+                page.add_script_tag(url=asset_url)
+            finally:
+                page.unroute(asset_url, serve_axe)
+        else:
+            page.add_script_tag(content=source)
         report = page.evaluate("async () => await axe.run(document, {resultTypes: ['violations']})")
         for violation in report.get("violations", []):
             severity = _AXE_IMPACT.get(violation.get("impact") or "minor", Severity.INFO)
